@@ -1,90 +1,183 @@
 import streamlit as st
 import requests
 import pandas as pd
+import xml.etree.ElementTree as ET
+from io import BytesIO
 
 BASE_URL = "http://197.189.218.35/utilidriver"
 
-st.set_page_config(
-    page_title="REM Meter Tool",
-    page_icon="⚡",
-    layout="wide"
-)
+st.set_page_config(page_title="REM Meter Tool", page_icon="⚡", layout="wide")
 
 st.title("⚡ Republic Metering - Meter Lookup Tool")
+st.write("Search by normal meter serial number. The app will find the UtiliDriver meter ref and then pull the profile.")
 
-st.write(
-    "Enter a meter number below and retrieve information from UtiliDriver."
-)
+serial_no = st.text_input("Enter meter serial number", value="")
 
-meter_no = st.text_input(
-    "Meter Number",
-    value=""
-)
+def get_all_meters():
+    """
+    Reads the UtiliDriver meters XML list.
+    Example endpoint:
+    http://197.189.218.35/utilidriver/api/meters/
+    """
+    url = f"{BASE_URL}/api/meters/"
+    response = requests.get(url, timeout=60)
+    response.raise_for_status()
 
-if st.button("Get Meter Data"):
+    root = ET.fromstring(response.text)
 
-    if meter_no == "":
-        st.warning("Please enter a meter number.")
-    else:
+    meters = []
+    for meter in root.findall(".//Meter"):
+        meters.append({
+            "serialNumber": meter.attrib.get("serialNumber", ""),
+            "state": meter.attrib.get("state", ""),
+            "ref": meter.attrib.get("ref", "")
+        })
 
+    return pd.DataFrame(meters)
+
+def find_meter_by_serial(serial):
+    df_meters = get_all_meters()
+
+    match = df_meters[df_meters["serialNumber"].astype(str) == str(serial)]
+
+    if match.empty:
+        return None, df_meters
+
+    return match.iloc[0].to_dict(), df_meters
+
+def get_profile_from_ref(meter_ref):
+    """
+    Uses the long UtiliDriver meter ref.
+    Example:
+    http://197.189.218.35/utilidriver/api/meters/4B414D0000000179382A/
+    Then tries common profile/register endpoints from that ref.
+    """
+    possible_urls = [
+        meter_ref,
+        meter_ref.rstrip("/") + "/profiles/",
+        meter_ref.rstrip("/") + "/profile/",
+        meter_ref.rstrip("/") + "/registers/",
+        meter_ref.rstrip("/") + "/readings/",
+    ]
+
+    results = []
+
+    for url in possible_urls:
         try:
-
-            url = f"{BASE_URL}/api/profiles/{meter_no}/"
-
-            response = requests.get(
-                url,
-                timeout=30
-            )
-
-            st.write(f"Status Code: {response.status_code}")
+            response = requests.get(url, timeout=60)
+            results.append({
+                "url": url,
+                "status_code": response.status_code,
+                "content_type": response.headers.get("Content-Type", ""),
+                "text": response.text
+            })
 
             if response.status_code == 200:
+                return response, results
 
-                try:
+        except Exception as e:
+            results.append({
+                "url": url,
+                "status_code": "ERROR",
+                "content_type": "",
+                "text": str(e)
+            })
 
-                    data = response.json()
+    return None, results
 
-                    df = pd.json_normalize(data)
+if st.button("Search Meter"):
+    if not serial_no.strip():
+        st.warning("Please enter a meter serial number.")
+    else:
+        try:
+            with st.spinner("Loading meter list from UtiliDriver..."):
+                meter, df_meters = find_meter_by_serial(serial_no.strip())
 
-                    st.success("Meter data successfully retrieved.")
+            if meter is None:
+                st.error("Meter serial number not found in UtiliDriver meter list.")
+                st.write("First 50 meters from UtiliDriver:")
+                st.dataframe(df_meters.head(50), use_container_width=True)
+            else:
+                st.success("Meter found.")
+                st.write("### Meter Details")
+                st.json(meter)
 
-                    st.dataframe(
-                        df,
-                        use_container_width=True
-                    )
+                meter_ref = meter["ref"]
 
-                    excel_file = f"Meter_{meter_no}.xlsx"
+                st.write("### UtiliDriver Meter Ref")
+                st.code(meter_ref)
 
-                    df.to_excel(
-                        excel_file,
-                        index=False
-                    )
+                with st.spinner("Trying to retrieve meter/profile/register data..."):
+                    response, attempts = get_profile_from_ref(meter_ref)
 
-                    with open(excel_file, "rb") as file:
+                st.write("### Endpoint Attempts")
+                st.dataframe(pd.DataFrame([
+                    {
+                        "url": item["url"],
+                        "status_code": item["status_code"],
+                        "content_type": item["content_type"],
+                        "preview": item["text"][:120]
+                    }
+                    for item in attempts
+                ]), use_container_width=True)
+
+                if response is None:
+                    st.error("Meter was found, but no working profile/register endpoint was found yet.")
+                    st.info("Open one of the UtiliDriver meter screens and send the exact URL/API endpoint used for profiles or registers.")
+                else:
+                    st.success("Data retrieved from UtiliDriver.")
+                    st.write("### Raw Response Preview")
+                    st.text(response.text[:3000])
+
+                    content_type = response.headers.get("Content-Type", "")
+
+                    # Try JSON first
+                    try:
+                        data = response.json()
+                        df = pd.json_normalize(data)
+                        st.write("### Table")
+                        st.dataframe(df, use_container_width=True)
+
+                        output = BytesIO()
+                        df.to_excel(output, index=False)
+                        output.seek(0)
 
                         st.download_button(
                             label="📥 Download Excel",
-                            data=file,
-                            file_name=excel_file,
+                            data=output,
+                            file_name=f"Meter_{serial_no}_data.xlsx",
                             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
                         )
 
-                except Exception as json_error:
+                    except Exception:
+                        # Try XML into a simple attribute table
+                        try:
+                            root = ET.fromstring(response.text)
+                            rows = []
+                            for elem in root.iter():
+                                row = {"tag": elem.tag}
+                                row.update(elem.attrib)
+                                if elem.text and elem.text.strip():
+                                    row["text"] = elem.text.strip()
+                                rows.append(row)
 
-                    st.error(
-                        f"Response received but could not convert JSON.\n\n{json_error}"
-                    )
+                            df = pd.DataFrame(rows)
+                            st.write("### XML Parsed Table")
+                            st.dataframe(df, use_container_width=True)
 
-                    st.text(response.text)
+                            output = BytesIO()
+                            df.to_excel(output, index=False)
+                            output.seek(0)
 
-            else:
+                            st.download_button(
+                                label="📥 Download Excel",
+                                data=output,
+                                file_name=f"Meter_{serial_no}_xml_data.xlsx",
+                                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                            )
 
-                st.error(
-                    f"Server returned status code {response.status_code}"
-                )
-
-                st.text(response.text)
+                        except Exception:
+                            st.warning("Response is not JSON or readable XML. Showing raw text only.")
 
         except Exception as e:
-
-            st.error(f"Connection Error: {e}")
+            st.error(f"Error: {e}")
