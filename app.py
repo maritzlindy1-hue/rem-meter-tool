@@ -5,7 +5,12 @@ import xml.etree.ElementTree as ET
 from io import BytesIO
 
 BASE_URL = "http://197.189.218.35/utilidriver"
-METER_PREFIX = "4B414D00000000"
+
+# IMPORTANT:
+# Correct Kamstrup meter ID format:
+# 4B414D + 0000000 + serial decimal converted to HEX
+# Example: 24165632 -> 170BD00 -> 4B414D0000000170BD00
+METER_PREFIX = "4B414D0000000"
 
 TARGET_OBIS = {
     "1.1.21.7.0.255": ("L1 Import Power", "watt", 3),
@@ -31,16 +36,18 @@ st.title("⚡ Republic Metering - Kamstrup Meter/Profile/OBIS Tool")
 
 def serial_to_meter_id(serial_number: str) -> str:
     serial_number = str(serial_number).strip()
+
     if not serial_number.isdigit():
         raise ValueError("Serial number must only contain numbers.")
+
     serial_hex = format(int(serial_number), "X").upper()
+
     return f"{METER_PREFIX}{serial_hex}"
 
 def get_meter_xml(meter_id: str):
     meter_url = f"{BASE_URL}/api/meters/{meter_id}/"
-    r = requests.get(meter_url, timeout=60)
-    r.raise_for_status()
-    return meter_url, r.text
+    response = requests.get(meter_url, timeout=60)
+    return meter_url, response
 
 def parse_meter_details(meter_xml: str):
     root = ET.fromstring(meter_xml)
@@ -84,6 +91,7 @@ def parse_meter_details(meter_xml: str):
 def parse_profile_registers(profile_xml: str):
     root = ET.fromstring(profile_xml)
     rows = []
+
     for reg in root.findall(".//Register"):
         rows.append({
             "Register ID": reg.attrib.get("id", ""),
@@ -91,10 +99,12 @@ def parse_profile_registers(profile_xml: str):
             "Actions": reg.attrib.get("actions", ""),
             "Command": reg.attrib.get("command", ""),
         })
+
     return pd.DataFrame(rows).drop_duplicates()
 
-def try_read_register(meter_id: str, obis: str):
+def test_register_endpoints(meter_id: str, obis: str):
     safe_obis = obis.replace(".", "%2E")
+
     urls = [
         f"{BASE_URL}/api/meters/{meter_id}/registers/{obis}/",
         f"{BASE_URL}/api/meters/{meter_id}/registers/{safe_obis}/",
@@ -109,6 +119,7 @@ def try_read_register(meter_id: str, obis: str):
     ]
 
     attempts = []
+
     for url in urls:
         try:
             r = requests.get(url, timeout=60)
@@ -119,8 +130,10 @@ def try_read_register(meter_id: str, obis: str):
                 "Content Type": r.headers.get("Content-Type", ""),
                 "Preview": r.text[:300],
             })
+
             if r.status_code == 200:
                 return r.text, attempts
+
         except Exception as e:
             attempts.append({
                 "OBIS": obis,
@@ -129,42 +142,59 @@ def try_read_register(meter_id: str, obis: str):
                 "Content Type": "",
                 "Preview": str(e),
             })
+
     return "", attempts
 
 def extract_value(text):
     if not text:
         return ""
+
     try:
         root = ET.fromstring(text)
+
         for attr in ["value", "Value"]:
             if attr in root.attrib:
                 return root.attrib[attr]
+
         for elem in root.iter():
-            if elem.tag.lower().endswith("value") and elem.text:
+            tag = elem.tag.lower()
+            if tag.endswith("value") and elem.text:
                 return elem.text.strip()
+
         return text[:500]
+
     except Exception:
         return text[:500]
 
 serial_no = st.text_input("Enter normal meter serial number", value="34977788")
 
-if serial_no:
-    try:
-        meter_id = serial_to_meter_id(serial_no)
-        st.write("### Converted Meter ID")
-        st.code(meter_id)
-        st.write("### Meter Endpoint")
-        st.code(f"{BASE_URL}/api/meters/{meter_id}/")
-    except Exception as e:
-        st.error(e)
-        meter_id = ""
+try:
+    meter_id = serial_to_meter_id(serial_no)
+
+    st.write("### Converted Meter ID")
+    st.code(meter_id)
+
+    st.write("### Meter Endpoint")
+    st.code(f"{BASE_URL}/api/meters/{meter_id}/")
+
+except Exception as e:
+    st.error(e)
+    meter_id = ""
 
 if st.button("Get Meter + Profile + OBIS"):
     try:
         meter_id = serial_to_meter_id(serial_no)
 
-        meter_url, meter_xml = get_meter_xml(meter_id)
-        details = parse_meter_details(meter_xml)
+        meter_url, meter_response = get_meter_xml(meter_id)
+
+        st.write("Meter endpoint status:", meter_response.status_code)
+
+        if meter_response.status_code != 200:
+            st.error(f"Meter endpoint did not open. Status: {meter_response.status_code}")
+            st.text(meter_response.text[:2000])
+            st.stop()
+
+        details = parse_meter_details(meter_response.text)
 
         st.success("Meter opened successfully.")
         st.write("### Meter Details")
@@ -174,75 +204,79 @@ if st.button("Get Meter + Profile + OBIS"):
 
         if not profile_ref:
             st.error("No Profile Ref found inside the meter XML.")
-        else:
-            st.write("### Profile Ref Found Automatically")
-            st.code(profile_ref)
+            st.stop()
 
-            profile_response = requests.get(profile_ref, timeout=60)
-            st.write("Profile Status:", profile_response.status_code)
+        st.write("### Profile Ref Found Automatically")
+        st.code(profile_ref)
 
-            if profile_response.status_code == 200:
-                df_profile = parse_profile_registers(profile_response.text)
+        profile_response = requests.get(profile_ref, timeout=60)
 
-                df_required = pd.DataFrame([
-                    {
-                        "Register ID": obis,
-                        "Description": desc,
-                        "Unit": unit,
-                        "Scale": scale,
-                        "Available in Profile": "YES" if obis in set(df_profile["Register ID"]) else "NO",
-                    }
-                    for obis, (desc, unit, scale) in TARGET_OBIS.items()
-                ])
+        st.write("Profile Status:", profile_response.status_code)
 
-                st.write("### Required OBIS Availability")
-                st.dataframe(df_required, use_container_width=True)
+        if profile_response.status_code != 200:
+            st.error(profile_response.text[:2000])
+            st.stop()
 
-                st.write("### All Readable Registers From This Meter Profile")
-                st.dataframe(df_profile, use_container_width=True)
+        df_profile = parse_profile_registers(profile_response.text)
 
-                all_attempts = []
-                result_rows = []
+        df_required = pd.DataFrame([
+            {
+                "Register ID": obis,
+                "Description": desc,
+                "Unit": unit,
+                "Scale": scale,
+                "Available in Profile": "YES" if obis in set(df_profile["Register ID"]) else "NO",
+            }
+            for obis, (desc, unit, scale) in TARGET_OBIS.items()
+        ])
 
-                for obis, (desc, unit, scale) in TARGET_OBIS.items():
-                    value_text, attempts = try_read_register(meter_id, obis)
-                    all_attempts.extend(attempts)
+        st.write("### Required OBIS Availability")
+        st.dataframe(df_required, use_container_width=True)
 
-                    result_rows.append({
-                        "Register ID": obis,
-                        "Description": desc,
-                        "Unit": unit,
-                        "Scale": scale,
-                        "Value": extract_value(value_text),
-                        "Status": "Read OK" if value_text else "Endpoint not confirmed",
-                    })
+        st.write("### All Readable Registers From This Meter Profile")
+        st.dataframe(df_profile, use_container_width=True)
 
-                df_results = pd.DataFrame(result_rows)
+        all_attempts = []
+        result_rows = []
 
-                st.write("### OBIS Read Results")
-                st.dataframe(df_results, use_container_width=True)
+        for obis, (desc, unit, scale) in TARGET_OBIS.items():
+            value_text, attempts = test_register_endpoints(meter_id, obis)
+            all_attempts.extend(attempts)
 
-                st.write("### Endpoint Attempts")
-                st.dataframe(pd.DataFrame(all_attempts), use_container_width=True)
+            result_rows.append({
+                "Register ID": obis,
+                "Description": desc,
+                "Unit": unit,
+                "Scale": scale,
+                "Value": extract_value(value_text),
+                "Status": "Read OK" if value_text else "Read endpoint not confirmed",
+            })
 
-                output = BytesIO()
-                with pd.ExcelWriter(output, engine="openpyxl") as writer:
-                    pd.DataFrame([details]).to_excel(writer, index=False, sheet_name="Meter Details")
-                    df_required.to_excel(writer, index=False, sheet_name="OBIS Availability")
-                    df_results.to_excel(writer, index=False, sheet_name="OBIS Results")
-                    pd.DataFrame(all_attempts).to_excel(writer, index=False, sheet_name="Endpoint Attempts")
-                    df_profile.to_excel(writer, index=False, sheet_name="Profile Registers")
-                output.seek(0)
+        df_results = pd.DataFrame(result_rows)
 
-                st.download_button(
-                    label="📥 Download Excel",
-                    data=output,
-                    file_name=f"Meter_{serial_no}_profile_obis.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                )
+        st.write("### OBIS Read Results")
+        st.dataframe(df_results, use_container_width=True)
 
-            else:
-                st.error(profile_response.text[:2000])
+        st.write("### Endpoint Attempts")
+        st.dataframe(pd.DataFrame(all_attempts), use_container_width=True)
+
+        output = BytesIO()
+
+        with pd.ExcelWriter(output, engine="openpyxl") as writer:
+            pd.DataFrame([details]).to_excel(writer, index=False, sheet_name="Meter Details")
+            df_required.to_excel(writer, index=False, sheet_name="OBIS Availability")
+            df_results.to_excel(writer, index=False, sheet_name="OBIS Results")
+            pd.DataFrame(all_attempts).to_excel(writer, index=False, sheet_name="Endpoint Attempts")
+            df_profile.to_excel(writer, index=False, sheet_name="Profile Registers")
+
+        output.seek(0)
+
+        st.download_button(
+            label="📥 Download Excel",
+            data=output,
+            file_name=f"Meter_{serial_no}_profile_obis.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
 
     except Exception as e:
         st.error(f"Error: {e}")
