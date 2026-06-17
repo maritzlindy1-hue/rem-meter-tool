@@ -5,179 +5,210 @@ import xml.etree.ElementTree as ET
 from io import BytesIO
 
 BASE_URL = "http://197.189.218.35/utilidriver"
+METER_PREFIX = "4B414D00000000"
+
+OBIS_CODES = {
+    "1.1.21.7.0.255": "L1 kW Import",
+    "1.1.22.7.0.255": "L1 kW Export",
+    "1.1.31.7.0.255": "L1 Current",
+    "1.1.32.7.0.255": "L1 Voltage",
+    "1.1.33.7.0.255": "L1 PF",
+    "1.1.41.7.0.255": "L2 kW Import",
+    "1.1.42.7.0.255": "L2 kW Export",
+    "1.1.51.7.0.255": "L2 Current",
+    "1.1.52.7.0.255": "L2 Voltage",
+    "1.1.53.7.0.255": "L2 PF",
+    "1.1.61.7.0.255": "L3 kW Import",
+    "1.1.62.7.0.255": "L3 kW Export",
+    "1.1.71.7.0.255": "L3 Current",
+    "1.1.72.7.0.255": "L3 Voltage",
+    "1.1.73.7.0.255": "L3 PF",
+}
 
 st.set_page_config(page_title="REM Meter Tool", page_icon="⚡", layout="wide")
+st.title("⚡ Republic Metering - Kamstrup OBIS Lookup")
 
-st.title("⚡ Republic Metering - Meter Lookup Tool")
-st.write("Search by normal meter serial number. The app will find the UtiliDriver meter ref and then pull the profile.")
-
-serial_no = st.text_input("Enter meter serial number", value="")
-
-def get_all_meters():
+def serial_to_meter_id(serial_number: str) -> str:
     """
-    Reads the UtiliDriver meters XML list.
-    Example endpoint:
-    http://197.189.218.35/utilidriver/api/meters/
-    """
-    url = f"{BASE_URL}/api/meters/"
-    response = requests.get(url, timeout=60)
-    response.raise_for_status()
+    Converts normal decimal serial number to the UtiliDriver long meter reference.
 
-    root = ET.fromstring(response.text)
-
-    meters = []
-    for meter in root.findall(".//Meter"):
-        meters.append({
-            "serialNumber": meter.attrib.get("serialNumber", ""),
-            "state": meter.attrib.get("state", ""),
-            "ref": meter.attrib.get("ref", "")
-        })
-
-    return pd.DataFrame(meters)
-
-def find_meter_by_serial(serial):
-    df_meters = get_all_meters()
-
-    match = df_meters[df_meters["serialNumber"].astype(str) == str(serial)]
-
-    if match.empty:
-        return None, df_meters
-
-    return match.iloc[0].to_dict(), df_meters
-
-def get_profile_from_ref(meter_ref):
-    """
-    Uses the long UtiliDriver meter ref.
     Example:
-    http://197.189.218.35/utilidriver/api/meters/4B414D0000000179382A/
-    Then tries common profile/register endpoints from that ref.
+    Serial: 24165632
+    Decimal to HEX: 170BD00
+    Final: 4B414D00000000170BD00
     """
-    possible_urls = [
-        meter_ref,
-        meter_ref.rstrip("/") + "/profiles/",
-        meter_ref.rstrip("/") + "/profile/",
-        meter_ref.rstrip("/") + "/registers/",
-        meter_ref.rstrip("/") + "/readings/",
+    serial_number = str(serial_number).strip()
+
+    if not serial_number.isdigit():
+        raise ValueError("Serial number must only contain numbers.")
+
+    serial_hex = format(int(serial_number), "X").upper()
+
+    return f"{METER_PREFIX}{serial_hex}"
+
+def read_url(url):
+    response = requests.get(url, timeout=60)
+    return response
+
+def xml_to_table(xml_text):
+    root = ET.fromstring(xml_text)
+    rows = []
+
+    for elem in root.iter():
+        row = {"tag": elem.tag}
+        row.update(elem.attrib)
+        text = (elem.text or "").strip()
+        if text:
+            row["text"] = text
+        rows.append(row)
+
+    return pd.DataFrame(rows)
+
+def try_obis_endpoints(meter_id):
+    """
+    UtiliDriver installations differ, so this tests the common patterns.
+    The page will show which endpoint works.
+    """
+    meter_url = f"{BASE_URL}/api/meters/{meter_id}/"
+
+    endpoints = [
+        meter_url,
+        f"{meter_url}registers/",
+        f"{meter_url}readings/",
+        f"{meter_url}obis/",
+        f"{meter_url}values/",
+        f"{BASE_URL}/api/registers/{meter_id}/",
+        f"{BASE_URL}/api/readings/{meter_id}/",
+        f"{BASE_URL}/api/obis/{meter_id}/",
+        f"{BASE_URL}/api/profiles/{meter_id}/",
     ]
 
-    results = []
+    attempts = []
 
-    for url in possible_urls:
+    for url in endpoints:
         try:
-            response = requests.get(url, timeout=60)
-            results.append({
+            r = read_url(url)
+            attempts.append({
                 "url": url,
-                "status_code": response.status_code,
-                "content_type": response.headers.get("Content-Type", ""),
-                "text": response.text
+                "status": r.status_code,
+                "content_type": r.headers.get("Content-Type", ""),
+                "preview": r.text[:250],
+                "response": r
             })
-
-            if response.status_code == 200:
-                return response, results
-
         except Exception as e:
-            results.append({
+            attempts.append({
                 "url": url,
-                "status_code": "ERROR",
+                "status": "ERROR",
                 "content_type": "",
-                "text": str(e)
+                "preview": str(e),
+                "response": None
             })
 
-    return None, results
+    return attempts
 
-if st.button("Search Meter"):
-    if not serial_no.strip():
-        st.warning("Please enter a meter serial number.")
-    else:
-        try:
-            with st.spinner("Loading meter list from UtiliDriver..."):
-                meter, df_meters = find_meter_by_serial(serial_no.strip())
+def extract_obis_rows_from_text(text):
+    """
+    Generic extractor. It looks for known OBIS codes in JSON/XML/text responses.
+    Once we know the exact UtiliDriver response format, this can be made cleaner.
+    """
+    rows = []
+    lower_text = text.lower()
 
-            if meter is None:
-                st.error("Meter serial number not found in UtiliDriver meter list.")
-                st.write("First 50 meters from UtiliDriver:")
-                st.dataframe(df_meters.head(50), use_container_width=True)
-            else:
-                st.success("Meter found.")
-                st.write("### Meter Details")
-                st.json(meter)
+    for obis, description in OBIS_CODES.items():
+        if obis in text:
+            rows.append({
+                "Register ID": obis,
+                "Description": description,
+                "Found in response": "Yes",
+                "Value": "",
+                "Unit": "",
+                "Scale": "",
+            })
 
-                meter_ref = meter["ref"]
+    return pd.DataFrame(rows)
 
-                st.write("### UtiliDriver Meter Ref")
-                st.code(meter_ref)
+serial_no = st.text_input("Enter normal meter serial number", value="24165632")
 
-                with st.spinner("Trying to retrieve meter/profile/register data..."):
-                    response, attempts = get_profile_from_ref(meter_ref)
+if serial_no:
+    try:
+        meter_id_preview = serial_to_meter_id(serial_no)
+        meter_url_preview = f"{BASE_URL}/api/meters/{meter_id_preview}/"
 
-                st.write("### Endpoint Attempts")
-                st.dataframe(pd.DataFrame([
-                    {
-                        "url": item["url"],
-                        "status_code": item["status_code"],
-                        "content_type": item["content_type"],
-                        "preview": item["text"][:120]
-                    }
-                    for item in attempts
-                ]), use_container_width=True)
+        st.write("### Converted UtiliDriver Meter ID")
+        st.code(meter_id_preview)
 
-                if response is None:
-                    st.error("Meter was found, but no working profile/register endpoint was found yet.")
-                    st.info("Open one of the UtiliDriver meter screens and send the exact URL/API endpoint used for profiles or registers.")
-                else:
-                    st.success("Data retrieved from UtiliDriver.")
-                    st.write("### Raw Response Preview")
-                    st.text(response.text[:3000])
+        st.write("### Meter API URL")
+        st.code(meter_url_preview)
 
-                    content_type = response.headers.get("Content-Type", "")
+    except Exception as e:
+        st.error(e)
 
-                    # Try JSON first
-                    try:
-                        data = response.json()
-                        df = pd.json_normalize(data)
-                        st.write("### Table")
-                        st.dataframe(df, use_container_width=True)
+if st.button("Get OBIS Readings"):
+    try:
+        meter_id = serial_to_meter_id(serial_no)
+        meter_url = f"{BASE_URL}/api/meters/{meter_id}/"
 
-                        output = BytesIO()
-                        df.to_excel(output, index=False)
-                        output.seek(0)
+        st.success("Serial converted successfully.")
+        st.write("Meter ID:", meter_id)
+        st.write("Meter URL:", meter_url)
 
-                        st.download_button(
-                            label="📥 Download Excel",
-                            data=output,
-                            file_name=f"Meter_{serial_no}_data.xlsx",
-                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                        )
+        with st.spinner("Testing UtiliDriver endpoints..."):
+            attempts = try_obis_endpoints(meter_id)
 
-                    except Exception:
-                        # Try XML into a simple attribute table
-                        try:
-                            root = ET.fromstring(response.text)
-                            rows = []
-                            for elem in root.iter():
-                                row = {"tag": elem.tag}
-                                row.update(elem.attrib)
-                                if elem.text and elem.text.strip():
-                                    row["text"] = elem.text.strip()
-                                rows.append(row)
+        attempts_table = pd.DataFrame([
+            {
+                "URL": a["url"],
+                "Status": a["status"],
+                "Content Type": a["content_type"],
+                "Preview": a["preview"]
+            }
+            for a in attempts
+        ])
 
-                            df = pd.DataFrame(rows)
-                            st.write("### XML Parsed Table")
-                            st.dataframe(df, use_container_width=True)
+        st.write("### Endpoint Test Results")
+        st.dataframe(attempts_table, use_container_width=True)
 
-                            output = BytesIO()
-                            df.to_excel(output, index=False)
-                            output.seek(0)
+        working = [a for a in attempts if a["status"] == 200 and a["response"] is not None]
 
-                            st.download_button(
-                                label="📥 Download Excel",
-                                data=output,
-                                file_name=f"Meter_{serial_no}_xml_data.xlsx",
-                                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                            )
+        if not working:
+            st.error("No endpoint returned status 200. The API path may need to be confirmed from UtiliDriver.")
+        else:
+            selected = working[0]
+            response = selected["response"]
 
-                        except Exception:
-                            st.warning("Response is not JSON or readable XML. Showing raw text only.")
+            st.write("### First Working Endpoint")
+            st.code(selected["url"])
 
-        except Exception as e:
-            st.error(f"Error: {e}")
+            st.write("### Raw Response Preview")
+            st.text(response.text[:4000])
+
+            # Try JSON
+            try:
+                data = response.json()
+                df = pd.json_normalize(data)
+                st.write("### Parsed JSON Table")
+                st.dataframe(df, use_container_width=True)
+            except Exception:
+                # Try XML
+                try:
+                    df = xml_to_table(response.text)
+                    st.write("### Parsed XML Table")
+                    st.dataframe(df, use_container_width=True)
+                except Exception:
+                    df = extract_obis_rows_from_text(response.text)
+                    st.write("### OBIS Codes Found")
+                    st.dataframe(df, use_container_width=True)
+
+            output = BytesIO()
+            df.to_excel(output, index=False)
+            output.seek(0)
+
+            st.download_button(
+                label="📥 Download Excel",
+                data=output,
+                file_name=f"Meter_{serial_no}_obis.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            )
+
+    except Exception as e:
+        st.error(f"Error: {e}")
